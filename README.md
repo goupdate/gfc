@@ -29,6 +29,12 @@ gfc ./pkg/myservice
 
 # Another project
 gfc ~/go/src/github.com/user/project
+
+# Dead code detection
+gfc --unused ./pkg/myservice
+
+# Output to stdout (no files)
+gfc --stdout ./pkg/myservice
 ```
 
 Output files:
@@ -38,6 +44,35 @@ Output files:
 | `callgraph.html` | Interactive MermaidJS diagram |
 | `callgraph_calls.txt` | `file: caller → file: callee` |
 | `callgraph_refs.txt` | `file: function — N refs` |
+| `unused.html` | Dead functions grouped by file — rectangles diagram |
+
+### `--unused` mode
+
+Finds functions with zero incoming calls (dead code). Outputs to stdout:
+
+```
+$ gfc --unused ./pkg
+dead code:
+main.go: main.deadFunc
+util.go: main.orphan
+```
+
+No output if no dead code found. `main()` and `init()` are excluded — they're entry points, not dead code.
+
+### `--stdout` mode
+
+Outputs `callgraph_calls.txt` content to stdout — no files created:
+
+```
+$ gfc --stdout ./pkg
+=== Call Graph: Caller → Callee ===
+
+main.go: main → main.go: helper1
+main.go: main → main.go: helper2
+
+=== dead code ===
+main.go: main.deadFunc
+```
 
 ## Example
 

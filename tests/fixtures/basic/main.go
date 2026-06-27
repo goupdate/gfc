@@ -16,3 +16,7 @@ type Helper struct{}
 
 // unreachable — не вызывается из main, не должен попасть в граф
 func unreachable() {}
+
+func unreachable2() {}
+
+func unreachable3() {}

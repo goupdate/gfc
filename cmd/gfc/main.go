@@ -47,9 +47,20 @@ type CallGraph struct {
 }
 
 func main() {
+	// --unused mode: find dead functions (zero incoming calls)
+	// --stdout mode: output callgraph_calls.txt to stdout, skip all file writes
+	unusedMode := false
+	stdoutMode := false
 	root := "."
-	if len(os.Args) > 1 {
-		root = os.Args[1]
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--unused":
+			unusedMode = true
+		case "--stdout":
+			stdoutMode = true
+		default:
+			root = os.Args[i]
+		}
 	}
 
 	g := &CallGraph{
@@ -66,22 +77,58 @@ func main() {
 
 	g.resolveEdges()
 
+	if unusedMode {
+		dead := g.linterDead()
+		if len(dead) > 0 {
+			fmt.Println("dead code:")
+			for _, d := range dead {
+				fmt.Println(d)
+			}
+		}
+		return
+	}
+
+	// Запоминаем dead-функции ДО фильтрации достижимости
+	deadFuncs := g.linterDead()
+
 	// Оставляем только функции, достижимые из main() и init()
 	reachable := g.reachableFromRoots([]string{"main", "init"})
 	g.filterReachable(reachable)
 
-	// Генерируем выходные файлы
-	mermaidHTML := g.generateMermaid(root)
-	os.WriteFile("callgraph.html", []byte(mermaidHTML), 0644)
-	fmt.Println("callgraph.html — MermaidJS диаграмма")
-
 	reportCalls := g.generateReportCalls()
+	if len(deadFuncs) > 0 {
+		reportCalls += "\n=== dead code ===\n"
+		for _, d := range deadFuncs {
+			reportCalls += d + "\n"
+		}
+	}
+
+	if stdoutMode {
+		fmt.Print(reportCalls)
+		return
+	}
+
 	os.WriteFile("callgraph_calls.txt", []byte(reportCalls), 0644)
 	fmt.Println("callgraph_calls.txt — отчёт caller → callee")
 
 	reportRefs := g.generateReportRefs()
+	if len(deadFuncs) > 0 {
+		reportRefs += "\n=== dead code ===\n"
+		for _, d := range deadFuncs {
+			reportRefs += d + "\n"
+		}
+	}
 	os.WriteFile("callgraph_refs.txt", []byte(reportRefs), 0644)
 	fmt.Println("callgraph_refs.txt — отчёт по количеству ссылок")
+
+	// Генерируем callgraph.html и unused.html
+	mermaidHTML := g.generateMermaid(root)
+	os.WriteFile("callgraph.html", []byte(mermaidHTML), 0644)
+	fmt.Println("callgraph.html — MermaidJS диаграмма")
+
+	unusedHTML := g.generateUnusedHTML(deadFuncs)
+	os.WriteFile("unused.html", []byte(unusedHTML), 0644)
+	fmt.Println("unused.html — граф потеряшек")
 }
 
 // parseDir рекурсивно парсит .go-файлы (кроме _test.go).
@@ -234,6 +281,102 @@ func (g *CallGraph) resolveCallee(file, callee string) string {
 		return pkg + "." + callee
 	}
 	return callee // не смогли разрешить
+}
+
+// linterDead возвращает список функций, которые никто не вызывает.
+// Формат: "file.go: pkg.func"
+// main и init исключаются (они точки входа).
+func (g *CallGraph) linterDead() []string {
+	// Считаем входящие вызовы
+	incoming := make(map[string]int)
+	for _, e := range g.Edges {
+		if _, ok := g.Funcs[e.Callee]; ok {
+			incoming[e.Callee]++
+		}
+	}
+
+	var dead []string
+	for key, f := range g.Funcs {
+		if incoming[key] > 0 {
+			continue
+		}
+		// main и init — точки входа, не dead code
+		if f.Recv == "" && (f.Name == "main" || f.Name == "init") {
+			continue
+		}
+		short := filepath.Base(f.File)
+		name := f.Name
+		if f.Recv != "" {
+			name = f.Recv + "." + f.Name
+		}
+		dead = append(dead, fmt.Sprintf("%s: %s.%s", short, f.Pkg, name))
+	}
+	sort.Strings(dead)
+	return dead
+}
+
+// generateUnusedHTML создаёт HTML с графом потеряшек — прямоугольники-файлы,
+// внутри которых скруглённые прямоугольники с именами dead-функций.
+func (g *CallGraph) generateUnusedHTML(deadFuncs []string) string {
+	var sb strings.Builder
+	sb.WriteString(`<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Unused Functions</title>
+<script>`)
+	sb.Write(mermaidJS)
+	sb.WriteString(`</script>
+<style>
+body { font-family: sans-serif; margin: 20px; }
+.mermaid { margin: 0 auto; }
+h1 { text-align: center; }
+</style>
+</head>
+<body>
+<h1>Unused Functions</h1>
+<div class="mermaid">
+graph TD
+`)
+
+	if len(deadFuncs) == 0 {
+		sb.WriteString("  A[\"no lost functions\"]\n")
+	} else {
+		// Группируем по файлам
+		fileFuncs := make(map[string][]string)
+		for _, d := range deadFuncs {
+			// Формат: "file.go: pkg.func"
+			parts := strings.SplitN(d, ":", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			file := strings.TrimSpace(parts[0])
+			funcName := strings.TrimSpace(parts[1])
+			// Для label: убираем pkg. префикс, оставляем func или recv.method
+			if idx := strings.IndexByte(funcName, '.'); idx >= 0 {
+				funcName = funcName[idx+1:]
+			}
+			fileFuncs[file] = append(fileFuncs[file], funcName)
+		}
+
+		var files []string
+		for f := range fileFuncs {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+
+		for _, file := range files {
+			funcs := fileFuncs[file]
+			subgraphID := sanitizeID("sg_" + file)
+			sb.WriteString(fmt.Sprintf("subgraph %s[\"%s\"]\n", subgraphID, file))
+			for i, fn := range funcs {
+				nodeID := sanitizeID(fmt.Sprintf("%s_%d", file, i))
+				sb.WriteString(fmt.Sprintf("  %s(\"%s\")\n", nodeID, fn))
+			}
+			sb.WriteString("end\n")
+		}
+	}
+
+	sb.WriteString("</div></body></html>\n")
+	return sb.String()
 }
 
 // reachableFromRoots возвращает множество достижимых функций из root-имён (main, init).

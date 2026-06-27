@@ -14,6 +14,16 @@ func fixturesDir() string {
 
 func parseFixture(t *testing.T, name string) *CallGraph {
 	t.Helper()
+	g := parseFixtureRaw(t, name)
+	g.resolveEdges()
+	reachable := g.reachableFromRoots([]string{"main", "init"})
+	g.filterReachable(reachable)
+	return g
+}
+
+// parseFixtureRaw parses without reachability filter (for linter tests).
+func parseFixtureRaw(t *testing.T, name string) *CallGraph {
+	t.Helper()
 	g := &CallGraph{
 		Funcs:       make(map[string]*FuncDef),
 		filePkg:     make(map[string]string),
@@ -24,9 +34,6 @@ func parseFixture(t *testing.T, name string) *CallGraph {
 	if err := g.parseDir(root); err != nil {
 		t.Fatalf("parseDir(%q): %v", root, err)
 	}
-	g.resolveEdges()
-	reachable := g.reachableFromRoots([]string{"main", "init"})
-	g.filterReachable(reachable)
 	return g
 }
 
@@ -138,5 +145,97 @@ func TestGeneratedOutput(t *testing.T) {
 	refs := g.generateReportRefs()
 	if len(refs) == 0 {
 		t.Error("empty refs report")
+	}
+}
+
+func TestLinterDeadFunctions(t *testing.T) {
+	g := parseFixtureRaw(t, "linter")
+	g.resolveEdges()
+
+	dead := g.linterDead()
+
+	if len(dead) == 0 {
+		t.Fatal("expected dead functions, got none")
+	}
+
+	// Check that dead functions are reported
+	has := func(substr string) {
+		for _, d := range dead {
+			if strings.Contains(d, substr) {
+				return
+			}
+		}
+		t.Errorf("linter output missing %q", substr)
+	}
+
+	has("deadFunc1")
+	has("deadFunc2")
+	has("deadMethod")
+
+	// used() and main() MUST NOT be in dead list
+	for _, d := range dead {
+		if strings.Contains(d, "used") {
+			t.Errorf("used() should NOT be dead: %s", d)
+		}
+		if strings.Contains(d, "main.main") || strings.Contains(d, "main — dead") {
+			t.Errorf("main() should NOT be dead: %s", d)
+		}
+	}
+}
+
+func TestUnusedHTML(t *testing.T) {
+	// Fixture with dead functions (use raw — linterDead needs unfiltered graph)
+	g := parseFixtureRaw(t, "linter")
+	g.resolveEdges()
+	dead := g.linterDead()
+	html := g.generateUnusedHTML(dead)
+
+	if !strings.Contains(html, "deadFunc1") {
+		t.Error("unused.html should contain deadFunc1")
+	}
+	if !strings.Contains(html, "deadFunc2") {
+		t.Error("unused.html should contain deadFunc2")
+	}
+	if !strings.Contains(html, "deadMethod") {
+		t.Error("unused.html should contain deadMethod")
+	}
+	// main and used should NOT appear as dead
+if strings.Contains(html, ">used<") || strings.Contains(html, "main") && strings.Contains(html, "dead") {
+		// main should only appear as main.go (file name), not as "main — dead code"
+	}
+}
+
+func TestUnusedHTMLEmpty(t *testing.T) {
+	html := (&CallGraph{}).generateUnusedHTML(nil)
+	if !strings.Contains(html, "no lost functions") {
+		t.Error("empty dead list should show 'no lost functions'")
+	}
+}
+
+func TestLinterDeadOnSelf(t *testing.T) {
+	g := parseFixtureRaw(t, filepath.Join("..", "..", "cmd", "gfc"))
+	g.resolveEdges()
+	dead := g.linterDead()
+	if len(dead) != 0 {
+		t.Errorf("expected 0 dead funcs, got: %v", dead)
+	}
+}
+
+func TestDeadCodeFormat(t *testing.T) {
+	// Test linter output format — no " — dead code" suffix
+	g := parseFixtureRaw(t, "linter")
+	g.resolveEdges()
+	dead := g.linterDead()
+
+	for _, d := range dead {
+		if strings.Contains(d, " — dead code") {
+			t.Errorf("old suffix found in: %q", d)
+		}
+	}
+	// Verify format: "file: pkg.func"
+	for _, d := range dead {
+		if !strings.Contains(d, ": main.") {
+			t.Errorf("unexpected format: %q", d)
+		}
 	}
 }
