@@ -108,8 +108,6 @@ checks := []struct{ caller, callee string }{
 		{pkg + ".main", pkg + ".*CallGraph.resolveEdges"},
 		{pkg + ".main", pkg + ".*CallGraph.generateMermaid"},
 		{pkg + ".main", pkg + ".*CallGraph.generateReportCalls"},
-		{pkg + ".main", pkg + ".*CallGraph.reachableFromRoots"},
-		{pkg + ".main", pkg + ".*CallGraph.filterReachable"},
 	}
 
 	for _, c := range checks {
@@ -210,9 +208,22 @@ func TestLinterDeadOnSelf(t *testing.T) {
 	g := parseFixtureRaw(t, filepath.Join("..", "..", "cmd", "gfc"))
 	g.resolveEdges()
 	dead := g.linterDead()
-	// generateReportRefs is dead — text output removed (no callgraph_refs.txt)
-	if len(dead) != 1 || !strings.Contains(dead[0], "generateReportRefs") {
-		t.Errorf("expected exactly 1 dead func (generateReportRefs), got: %v", dead)
+	// generateReportRefs, reachableFromRoots, filterReachable are dead
+	// (reachableFromRoots and filterReachable no longer called after removing reachability filter)
+	if len(dead) != 3 {
+		t.Errorf("expected exactly 3 dead funcs, got: %v", dead)
+	}
+	for _, name := range []string{"generateReportRefs", "reachableFromRoots", "filterReachable"} {
+		found := false
+		for _, d := range dead {
+			if strings.Contains(d, name) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected dead func %q not found in: %v", name, dead)
+		}
 	}
 }
 

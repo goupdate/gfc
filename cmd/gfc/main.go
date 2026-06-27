@@ -59,9 +59,10 @@ Features:
     and function nodes
   • Call graph report — grouped by file, intra-file calls
     shown without prefix
+  • Full graph — shows ALL functions in the scanned code
   • Dead code detection — finds functions with zero incoming calls
-  • Reachability filter — only shows functions reachable
-    from main() and init()
+  • External library nodes — functions from packages outside
+    the scan directory shown as leaf nodes (no recursion)
   • Receiver method resolution — correctly links g.method()
     to *CallGraph.method
   • Zero external dependencies — uses only Go standard library
@@ -154,10 +155,6 @@ func main() {
 		}
 		return
 	}
-
-	// Фильтруем достижимые из main/init
-	reachable := g.reachableFromRoots([]string{"main", "init"})
-	g.filterReachable(reachable)
 
 	// --graphs: только HTML-файлы
 	if graphsMode {
@@ -375,10 +372,22 @@ func (g *CallGraph) generateUnusedHTML(deadFuncs []string) string {
 <script>`)
 	sb.Write(mermaidJS)
 	sb.WriteString(`</script>
+<script>
+mermaid.initialize({ startOnLoad: false, maxTextSize: 900000,
+  flowchart: { useMaxWidth: true, htmlLabels: true },
+  securityLevel: 'loose' });
+window.addEventListener('DOMContentLoaded', function() {
+  mermaid.run({ querySelector: '.mermaid' }).catch(function(err) {
+    document.getElementById('mermaid-error').style.display = 'block';
+    document.getElementById('mermaid-error').textContent = 'Render error: ' + err;
+  });
+});
+</script>
 <style>
 body { font-family: sans-serif; margin: 20px; }
 .mermaid { margin: 0 auto; }
 h1 { text-align: center; }
+#mermaid-error { color: red; display: none; margin: 20px; white-space: pre-wrap; font-family: monospace; }
 </style>
 </head>
 <body>
@@ -425,7 +434,7 @@ graph TD
 		}
 	}
 
-	sb.WriteString("</div></body></html>\n")
+	sb.WriteString("</div>\n<div id=\"mermaid-error\"></div>\n</body></html>\n")
 	return sb.String()
 }
 
@@ -479,19 +488,46 @@ func (g *CallGraph) filterReachable(reachable map[string]bool) {
 	g.Edges = filtered
 }
 
+// externalCallees возвращает уникальные callee, которых нет в g.Funcs
+// (функции из библиотек вне каталога сканирования).
+func (g *CallGraph) externalCallees() map[string]bool {
+	ext := make(map[string]bool)
+	for _, e := range g.Edges {
+		if _, ok := g.Funcs[e.Callee]; !ok {
+			ext[e.Callee] = true
+		}
+	}
+	return ext
+}
+
 // generateMermaid создаёт HTML с MermaidJS-диаграммой.
 func (g *CallGraph) generateMermaid(root string) string {
 	var sb strings.Builder
+
+	extCallees := g.externalCallees()
+
 	sb.WriteString(`<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Call Graph — ` + filepath.Base(root) + `</title>
 <script>`)
 	sb.Write(mermaidJS)
 	sb.WriteString(`</script>
+<script>
+mermaid.initialize({ startOnLoad: false, maxTextSize: 900000, maxEdges: 10000,
+  flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' },
+  securityLevel: 'loose' });
+window.addEventListener('DOMContentLoaded', function() {
+  mermaid.run({ querySelector: '.mermaid' }).catch(function(err) {
+    document.getElementById('mermaid-error').style.display = 'block';
+    document.getElementById('mermaid-error').textContent = 'Render error: ' + err;
+  });
+});
+</script>
 <style>
 body { font-family: sans-serif; margin: 20px; }
 .mermaid { margin: 0 auto; }
 h1 { text-align: center; }
+#mermaid-error { color: red; display: none; margin: 20px; white-space: pre-wrap; font-family: monospace; }
 </style>
 </head>
 <body>
@@ -517,6 +553,9 @@ graph TD
 		short := filepath.Base(f.File)
 		return sanitizeID(short + "_" + f.Name)
 	}
+	extNodeID := func(callee string) string {
+		return sanitizeID("ext_" + callee)
+	}
 
 	// Рисуем подграфы для каждого файла
 	for _, file := range files {
@@ -536,31 +575,72 @@ graph TD
 		sb.WriteString("end\n")
 	}
 
-	// Рисуем рёбра (только между функциями, которые есть в графе)
+	// Подграф для внешних (external) функций
+	if len(extCallees) > 0 {
+		// Группируем по пакетам
+		extByPkg := make(map[string][]string) // pkg → [funcName]
+		type extPair struct{ pkg, name string }
+		var extPairs []extPair
+		for callee := range extCallees {
+			var pkg, name string
+			if idx := strings.IndexByte(callee, '.'); idx >= 0 {
+				pkg = callee[:idx]
+				name = callee[idx+1:]
+			} else {
+				pkg = "."
+				name = callee
+			}
+			extByPkg[pkg] = append(extByPkg[pkg], name)
+			extPairs = append(extPairs, extPair{pkg, name})
+		}
+
+		var pkgs []string
+		for p := range extByPkg {
+			pkgs = append(pkgs, p)
+		}
+		sort.Strings(pkgs)
+
+		for _, pkg := range pkgs {
+			funcs := extByPkg[pkg]
+			sort.Strings(funcs)
+			sgID := sanitizeID("ext_pkg_" + pkg)
+			sb.WriteString(fmt.Sprintf("subgraph %s[\"%s\"]\n", sgID, pkg+" (ext)"))
+			for _, fn := range funcs {
+				nid := extNodeID(pkg + "." + fn)
+				sb.WriteString(fmt.Sprintf("  %s[\"%s\"]\n", nid, fn))
+			}
+			sb.WriteString("end\n")
+		}
+	}
+
+	// Рисуем рёбра
 	seen := make(map[string]bool)
 	for _, e := range g.Edges {
-		// Находим caller
 		callerKey := e.CallerFunc
 		src, srcOK := g.Funcs[callerKey]
 		if !srcOK {
 			continue
 		}
-		// Находим callee
-		dst, dstOK := g.Funcs[e.Callee]
-		if !dstOK {
-			continue
-		}
 
-		edgeKey := funcID(src) + "->" + funcID(dst)
-		if seen[edgeKey] {
-			continue
+		var edgeKey string
+		if dst, dstOK := g.Funcs[e.Callee]; dstOK {
+			edgeKey = funcID(src) + "->" + funcID(dst)
+			if seen[edgeKey] {
+				continue
+			}
+			seen[edgeKey] = true
+			sb.WriteString(fmt.Sprintf("%s --> %s\n", funcID(src), funcID(dst)))
+		} else if extCallees[e.Callee] {
+			edgeKey = funcID(src) + "->" + extNodeID(e.Callee)
+			if seen[edgeKey] {
+				continue
+			}
+			seen[edgeKey] = true
+			sb.WriteString(fmt.Sprintf("%s --> %s\n", funcID(src), extNodeID(e.Callee)))
 		}
-		seen[edgeKey] = true
-
-		sb.WriteString(fmt.Sprintf("%s --> %s\n", funcID(src), funcID(dst)))
 	}
 
-	sb.WriteString("</div></body></html>\n")
+	sb.WriteString("</div>\n<div id=\"mermaid-error\"></div>\n</body></html>\n")
 	return sb.String()
 }
 
@@ -574,19 +654,25 @@ func (g *CallGraph) generateJSON() string {
 	calls := make(fileCalls)
 	for _, e := range g.Edges {
 		src, srcOK := g.Funcs[e.CallerFunc]
-		dst, dstOK := g.Funcs[e.Callee]
-		if !srcOK || !dstOK {
+		if !srcOK {
 			continue
 		}
 		srcName := src.Name
 		if src.Recv != "" {
 			srcName = src.Recv + "." + src.Name
 		}
-		dstName := dst.Name
-		if dst.Recv != "" {
-			dstName = dst.Recv + "." + dst.Name
-		}
 		srcFile := filepath.Base(src.File)
+
+		var dstName string
+		if dst, dstOK := g.Funcs[e.Callee]; dstOK {
+			dstName = dst.Name
+			if dst.Recv != "" {
+				dstName = dst.Recv + "." + dst.Name
+			}
+		} else {
+			// Внешняя функция — показываем полное имя
+			dstName = "[ext] " + e.Callee
+		}
 
 		if calls[srcFile] == nil {
 			calls[srcFile] = make(map[string][]string)
@@ -620,8 +706,7 @@ func (g *CallGraph) generateReportCalls() string {
 	fileEdges := make(map[string][]CallEdge)
 	for _, e := range g.Edges {
 		src, srcOK := g.Funcs[e.CallerFunc]
-		_, dstOK := g.Funcs[e.Callee]
-		if !srcOK || !dstOK {
+		if !srcOK {
 			continue
 		}
 		fileEdges[src.File] = append(fileEdges[src.File], e)
@@ -648,23 +733,27 @@ func (g *CallGraph) generateReportCalls() string {
 			seen[key] = true
 
 			src := g.Funcs[e.CallerFunc]
-			dst := g.Funcs[e.Callee]
 
 			srcName := src.Name
 			if src.Recv != "" {
 				srcName = src.Recv + "." + src.Name
 			}
-			dstName := dst.Name
-			if dst.Recv != "" {
-				dstName = dst.Recv + "." + dst.Name
-			}
 
-			// Callee из того же файла — без префикса; иначе file.go: func
-			if dst.File == file {
-				sb.WriteString(fmt.Sprintf("%s → %s\n", srcName, dstName))
+			if dst, dstOK := g.Funcs[e.Callee]; dstOK {
+				dstName := dst.Name
+				if dst.Recv != "" {
+					dstName = dst.Recv + "." + dst.Name
+				}
+				// Callee из того же файла — без префикса; иначе file.go: func
+				if dst.File == file {
+					sb.WriteString(fmt.Sprintf("%s → %s\n", srcName, dstName))
+				} else {
+					dstShort := filepath.Base(dst.File)
+					sb.WriteString(fmt.Sprintf("%s → %s: %s\n", srcName, dstShort, dstName))
+				}
 			} else {
-				dstShort := filepath.Base(dst.File)
-				sb.WriteString(fmt.Sprintf("%s → %s: %s\n", srcName, dstShort, dstName))
+				// Внешняя функция (библиотека вне каталога сканирования)
+				sb.WriteString(fmt.Sprintf("%s → [ext] %s\n", srcName, e.Callee))
 			}
 		}
 	}
