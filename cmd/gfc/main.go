@@ -1,0 +1,505 @@
+// golinkgrapher — строит граф вызовов функций Go-проекта и генерирует:
+//   1. MermaidJS-диаграмму в HTML (прямоугольники-файлы, скруглённые — функции)
+//   2. Текстовый отчёт: caller → callee
+//   3. Текстовый отчёт: функция — сколько раз на неё ссылаются
+//
+// Использование: go run ./cmd/golinkgrapher [директория проекта]
+package main
+
+import (
+	_ "embed"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+//go:embed mermaid.min.js
+var mermaidJS []byte
+
+// FuncDef — объявление функции.
+type FuncDef struct {
+	File    string // путь к файлу
+	Pkg     string // имя пакета
+	Name    string // имя функции
+	Recv    string // получатель метода (пусто для функций)
+	IsExported bool
+}
+
+// CallEdge — ребро вызова.
+type CallEdge struct {
+	CallerFile string
+	CallerFunc string
+	Callee     string // как записано в коде: "Func", "pkg.Func", "recv.Method"
+}
+
+// CallGraph — полный граф вызовов.
+type CallGraph struct {
+	Funcs       map[string]*FuncDef // key: полное имя "pkg.Func" | "pkg.Recv.Method"
+	Edges       []CallEdge
+	filePkg     map[string]string            // file → package name
+	fileImports map[string]map[string]string // file → (alias → importPath)
+	fset        *token.FileSet
+}
+
+func main() {
+	root := "."
+	if len(os.Args) > 1 {
+		root = os.Args[1]
+	}
+
+	g := &CallGraph{
+		Funcs:       make(map[string]*FuncDef),
+		filePkg:     make(map[string]string),
+		fileImports: make(map[string]map[string]string),
+		fset:        token.NewFileSet(),
+	}
+
+	if err := g.parseDir(root); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	g.resolveEdges()
+
+	// Оставляем только функции, достижимые из main() и init()
+	reachable := g.reachableFromRoots([]string{"main", "init"})
+	g.filterReachable(reachable)
+
+	// Генерируем выходные файлы
+	mermaidHTML := g.generateMermaid(root)
+	os.WriteFile("callgraph.html", []byte(mermaidHTML), 0644)
+	fmt.Println("callgraph.html — MermaidJS диаграмма")
+
+	reportCalls := g.generateReportCalls()
+	os.WriteFile("callgraph_calls.txt", []byte(reportCalls), 0644)
+	fmt.Println("callgraph_calls.txt — отчёт caller → callee")
+
+	reportRefs := g.generateReportRefs()
+	os.WriteFile("callgraph_refs.txt", []byte(reportRefs), 0644)
+	fmt.Println("callgraph_refs.txt — отчёт по количеству ссылок")
+}
+
+// parseDir рекурсивно парсит .go-файлы (кроме _test.go).
+func (g *CallGraph) parseDir(root string) error {
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			name := info.Name()
+			if name == "vendor" || name == ".git" || name == "node_modules" || strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		return g.parseFile(path)
+	})
+	if err != nil {
+		return err
+	}
+	g.resolveEdges()
+	return nil
+}
+
+// parseFile парсит один .go-файл.
+func (g *CallGraph) parseFile(path string) error {
+	node, err := parser.ParseFile(g.fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	pkg := node.Name.Name
+	g.filePkg[path] = pkg
+
+	// Собираем импорты
+	imports := make(map[string]string)
+	for _, imp := range node.Imports {
+		impPath := strings.Trim(imp.Path.Value, `"`)
+		alias := ""
+		if imp.Name != nil {
+			alias = imp.Name.Name
+		} else {
+			// Имя по умолчанию — последний элемент пути
+			parts := strings.Split(impPath, "/")
+			alias = parts[len(parts)-1]
+		}
+		imports[alias] = impPath
+	}
+	g.fileImports[path] = imports
+
+	// Собираем объявления функций
+	for _, decl := range node.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		name := fd.Name.Name
+
+		// Определяем получатель
+		recv := ""
+		if fd.Recv != nil && len(fd.Recv.List) > 0 {
+			recv = typeExprString(fd.Recv.List[0].Type)
+		}
+
+		fullName := pkg + "." + name
+		if recv != "" {
+			fullName = pkg + "." + recv + "." + name
+		}
+
+		g.Funcs[fullName] = &FuncDef{
+			File:       path,
+			Pkg:        pkg,
+			Name:       name,
+			Recv:       recv,
+			IsExported: ast.IsExported(name),
+		}
+	}
+
+	// Собираем вызовы функций — проходим по AST, запоминая контекст (в какой мы функции)
+	var currentFunc string
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.FuncDecl:
+			recv := ""
+			if x.Recv != nil && len(x.Recv.List) > 0 {
+				recv = typeExprString(x.Recv.List[0].Type)
+			}
+			currentFunc = x.Name.Name
+			if recv != "" {
+				currentFunc = recv + "." + x.Name.Name
+			}
+		case *ast.CallExpr:
+			if currentFunc == "" {
+				break
+			}
+			callee := callExprString(x)
+			if callee == "" || isBuiltin(callee) {
+				break
+			}
+			g.Edges = append(g.Edges, CallEdge{
+				CallerFile: path,
+				CallerFunc: pkg + "." + currentFunc,
+				Callee:     callee,
+			})
+		}
+		return true
+	})
+
+	return nil
+}
+
+// resolveEdges разрешает короткие имена вызовов в полные, используя импорты.
+func (g *CallGraph) resolveEdges() {
+	for i, e := range g.Edges {
+		resolved := g.resolveCallee(e.CallerFile, e.Callee)
+		if resolved != "" {
+			g.Edges[i].Callee = resolved
+		}
+	}
+}
+
+// resolveCallee превращает "Func", "pkg.Func" или "var.Method" в полное имя.
+func (g *CallGraph) resolveCallee(file, callee string) string {
+	// Уже полное имя? (pkg.Func)
+	if strings.Contains(callee, ".") {
+		parts := strings.SplitN(callee, ".", 2)
+		alias := parts[0]
+		imports := g.fileImports[file]
+		if impPath, ok := imports[alias]; ok {
+			impPkg := pkgNameFromPath(impPath)
+			return impPkg + "." + parts[1]
+		}
+		// Не импорт — может быть вызовом метода на локальной переменной:
+		//   g.generateMermaid() → ищем в Funcs ключ, оканчивающийся на ".generateMermaid"
+		suffix := "." + parts[1]
+		for key := range g.Funcs {
+			if strings.HasSuffix(key, suffix) {
+				return key
+			}
+		}
+		// Не нашли — возвращаем как есть (локальный метод/функция этого же файла)
+		return callee
+	}
+	// Простое имя — ищем в текущем пакете
+	pkg := g.filePkg[file]
+	if _, ok := g.Funcs[pkg+"."+callee]; ok {
+		return pkg + "." + callee
+	}
+	return callee // не смогли разрешить
+}
+
+// reachableFromRoots возвращает множество достижимых функций из root-имён (main, init).
+func (g *CallGraph) reachableFromRoots(roots []string) map[string]bool {
+	reachable := make(map[string]bool)
+	queue := []string{}
+
+	// Находим все функции с именами main или init в любом пакете
+	for key := range g.Funcs {
+		for _, root := range roots {
+			if strings.HasSuffix(key, "."+root) {
+				reachable[key] = true
+				queue = append(queue, key)
+			}
+		}
+	}
+
+	// BFS по рёбрам
+	for len(queue) > 0 {
+		caller := queue[0]
+		queue = queue[1:]
+		for _, e := range g.Edges {
+			if e.CallerFunc == caller {
+				if !reachable[e.Callee] {
+					reachable[e.Callee] = true
+					queue = append(queue, e.Callee)
+				}
+			}
+		}
+	}
+
+	return reachable
+}
+
+// filterReachable оставляет только достижимые функции и рёбра.
+func (g *CallGraph) filterReachable(reachable map[string]bool) {
+	// Фильтруем функции
+	for key := range g.Funcs {
+		if !reachable[key] {
+			delete(g.Funcs, key)
+		}
+	}
+	// Фильтруем рёбра
+	filtered := g.Edges[:0]
+	for _, e := range g.Edges {
+		if reachable[e.CallerFunc] && reachable[e.Callee] {
+			filtered = append(filtered, e)
+		}
+	}
+	g.Edges = filtered
+}
+
+// generateMermaid создаёт HTML с MermaidJS-диаграммой.
+func (g *CallGraph) generateMermaid(root string) string {
+	var sb strings.Builder
+	sb.WriteString(`<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Call Graph — ` + filepath.Base(root) + `</title>
+<script>`)
+	sb.Write(mermaidJS)
+	sb.WriteString(`</script>
+<style>
+body { font-family: sans-serif; margin: 20px; }
+.mermaid { margin: 0 auto; }
+h1 { text-align: center; }
+</style>
+</head>
+<body>
+<h1>Call Graph: ` + filepath.Base(root) + `</h1>
+<div class="mermaid">
+graph TD
+`)
+
+	// Группируем функции по файлам
+	fileFuncs := make(map[string][]*FuncDef)
+	for _, f := range g.Funcs {
+		fileFuncs[f.File] = append(fileFuncs[f.File], f)
+	}
+
+	// Сортируем файлы
+	var files []string
+	for f := range fileFuncs {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	funcID := func(f *FuncDef) string {
+		short := filepath.Base(f.File)
+		return sanitizeID(short + "_" + f.Name)
+	}
+
+	// Рисуем подграфы для каждого файла
+	for _, file := range files {
+		funcs := fileFuncs[file]
+		short := filepath.Base(file)
+		subgraphID := sanitizeID("sg_" + short)
+
+		sb.WriteString(fmt.Sprintf("subgraph %s[\"%s\"]\n", subgraphID, short))
+		for _, f := range funcs {
+			displayName := f.Name
+			if f.Recv != "" {
+				displayName = f.Recv + "." + f.Name
+			}
+			id := funcID(f)
+			sb.WriteString(fmt.Sprintf("  %s(\"%s\")\n", id, displayName))
+		}
+		sb.WriteString("end\n")
+	}
+
+	// Рисуем рёбра (только между функциями, которые есть в графе)
+	seen := make(map[string]bool)
+	for _, e := range g.Edges {
+		// Находим caller
+		callerKey := e.CallerFunc
+		src, srcOK := g.Funcs[callerKey]
+		if !srcOK {
+			continue
+		}
+		// Находим callee
+		dst, dstOK := g.Funcs[e.Callee]
+		if !dstOK {
+			continue
+		}
+
+		edgeKey := funcID(src) + "->" + funcID(dst)
+		if seen[edgeKey] {
+			continue
+		}
+		seen[edgeKey] = true
+
+		sb.WriteString(fmt.Sprintf("%s --> %s\n", funcID(src), funcID(dst)))
+	}
+
+	sb.WriteString("</div></body></html>\n")
+	return sb.String()
+}
+
+// generateReportCalls — отчёт caller → callee.
+func (g *CallGraph) generateReportCalls() string {
+	var sb strings.Builder
+	sb.WriteString("=== Call Graph: Caller → Callee ===\n\n")
+
+	seen := make(map[string]bool)
+	for _, e := range g.Edges {
+		key := e.CallerFunc + "→" + e.Callee
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		src, srcOK := g.Funcs[e.CallerFunc]
+		dst, dstOK := g.Funcs[e.Callee]
+		if !srcOK || !dstOK {
+			continue
+		}
+
+		srcShort := filepath.Base(src.File)
+		dstShort := filepath.Base(dst.File)
+
+		srcName := src.Name
+		if src.Recv != "" {
+			srcName = src.Recv + "." + src.Name
+		}
+		dstName := dst.Name
+		if dst.Recv != "" {
+			dstName = dst.Recv + "." + dst.Name
+		}
+
+		sb.WriteString(fmt.Sprintf("%s: %s → %s: %s\n",
+			srcShort, srcName, dstShort, dstName))
+	}
+	return sb.String()
+}
+
+// generateReportRefs — отчёт: функция — сколько раз на неё ссылаются.
+func (g *CallGraph) generateReportRefs() string {
+	refCount := make(map[string]int)
+
+	for _, e := range g.Edges {
+		if _, ok := g.Funcs[e.Callee]; ok {
+			refCount[e.Callee]++
+		}
+	}
+
+	type entry struct {
+		key   string
+		count int
+		def   *FuncDef
+	}
+	var entries []entry
+	for _, f := range g.Funcs {
+		fullName := f.Pkg + "." + f.Name
+		if f.Recv != "" {
+			fullName = f.Pkg + "." + f.Recv + "." + f.Name
+		}
+		entries = append(entries, entry{fullName, refCount[fullName], f})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].key < entries[j].key
+	})
+
+	var sb strings.Builder
+	sb.WriteString("=== Reference Count (incoming calls) ===\n\n")
+
+	for _, e := range entries {
+		short := filepath.Base(e.def.File)
+		name := e.def.Name
+		if e.def.Recv != "" {
+			name = e.def.Recv + "." + e.def.Name
+		}
+		sb.WriteString(fmt.Sprintf("%s: %s — %d\n", short, name, e.count))
+	}
+	return sb.String()
+}
+
+// --- helpers ---
+
+func typeExprString(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + typeExprString(t.X)
+	case *ast.SelectorExpr:
+		return typeExprString(t.X) + "." + t.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func callExprString(call *ast.CallExpr) string {
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		return typeExprString(fun.X) + "." + fun.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func isBuiltin(name string) bool {
+	switch name {
+	case "make", "len", "cap", "new", "append", "copy", "close",
+		"delete", "panic", "recover", "print", "println",
+		"complex", "real", "imag":
+		return true
+	}
+	return false
+}
+
+func pkgNameFromPath(importPath string) string {
+	parts := strings.Split(importPath, "/")
+	return parts[len(parts)-1]
+}
+
+func sanitizeID(s string) string {
+	// MermaidJS ID: разрешены буквы, цифры, подчёркивания
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
+}
