@@ -393,7 +393,7 @@ h1 { text-align: center; }
 <body>
 <h1>Unused Functions</h1>
 <div class="mermaid">
-graph TD
+flowchart TB
 `)
 
 	if len(deadFuncs) == 0 {
@@ -514,7 +514,7 @@ func (g *CallGraph) generateMermaid(root string) string {
 	sb.WriteString(`</script>
 <script>
 mermaid.initialize({ startOnLoad: false, maxTextSize: 900000, maxEdges: 10000,
-  flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' },
+  flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis', rankDir: 'TB' },
   securityLevel: 'loose' });
 window.addEventListener('DOMContentLoaded', function() {
   mermaid.run({ querySelector: '.mermaid' }).catch(function(err) {
@@ -533,7 +533,7 @@ h1 { text-align: center; }
 <body>
 <h1>Call Graph: ` + filepath.Base(root) + `</h1>
 <div class="mermaid">
-graph TD
+flowchart TB
 `)
 
 	// Группируем функции по файлам
