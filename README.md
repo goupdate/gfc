@@ -1,12 +1,13 @@
 # GoFunCaller (gfc)
 
-Static call graph generator for Go projects. Produces MermaidJS diagrams and text reports from AST analysis — no runtime instrumentation needed.
+Static call graph generator for Go projects. Produces MermaidJS diagrams and text reports from AST analysis — no runtime instrumentation needed. Designed as a standalone tool and a linter module (`-j` / `--json`).
 
 ## Features
 
 - **MermaidJS diagram** — interactive HTML with file subgraphs and function nodes
-- **Caller → Callee report** — plain text edge list
-- **Reference count report** — functions ranked by incoming calls
+- **Call graph report** — grouped by file, intra-file calls without prefix
+- **Dead code detection** — `-u` / `--unused` finds functions with zero incoming calls
+- **JSON output** — `-j` / `--json` for CI/linter integration
 - **Reachability filter** — only shows functions reachable from `main()` and `init()`
 - **Receiver method resolution** — correctly links `g.method()` to `*CallGraph.method`
 - **Zero dependencies** — uses only Go standard library (`go/ast`, `go/parser`)
@@ -20,91 +21,70 @@ go install github.com/goupdate/gofuncaller/cmd/gfc@latest
 
 ## Usage
 
-```bash
-# Current directory
-gfc
-
-# Specific directory
-gfc ./pkg/myservice
-
-# Another project
-gfc ~/go/src/github.com/user/project
-
-# Dead code detection
-gfc --unused ./pkg/myservice
-
-# Output to stdout (no files)
-gfc --stdout ./pkg/myservice
+```
+gfc [flags] [directory]
 ```
 
-Output files:
+### Modes
 
-| File | Description |
+| Flag | Description |
 |---|---|
-| `callgraph.html` | Interactive MermaidJS diagram |
-| `callgraph_calls.txt` | `file: caller → file: callee` |
-| `callgraph_refs.txt` | `file: function — N refs` |
-| `unused.html` | Dead functions grouped by file — rectangles diagram |
+| _(default)_ | Text report to stdout — calls grouped by file + dead code block |
+| `-u`, `--unused` | Dead code list to stdout |
+| `-j`, `--json` | JSON to stdout — for CI/linter integration |
+| `-g`, `--graphs` | Generate `callgraph.html` + `unused.html` |
 
-### `--unused` mode
-
-Finds functions with zero incoming calls (dead code). Outputs to stdout:
+### Default mode
 
 ```
-$ gfc --unused ./pkg
-dead code:
-main.go: main.deadFunc
-util.go: main.orphan
-```
+$ gfc ./pkg
+=== main.go ===
+main → helper1
+main → helper2
+helper1 → helper2
 
-No output if no dead code found. `main()` and `init()` are excluded — they're entry points, not dead code.
-
-### `--stdout` mode
-
-Outputs `callgraph_calls.txt` content to stdout — no files created:
-
-```
-$ gfc --stdout ./pkg
-=== Call Graph: Caller → Callee ===
-
-main.go: main → main.go: helper1
-main.go: main → main.go: helper2
+=== util.go ===
+helper2 → util.go: logError
 
 === dead code ===
-main.go: main.deadFunc
+main.go: main.orphanFunc
+util.go: main.oldHelper
 ```
 
-## Example
+### Dead code detection (`-u`)
 
-![Basic call graph](examples/basic.png)
+```
+$ gfc -u ./pkg
+dead code:
+main.go: main.orphanFunc
+util.go: main.oldHelper
+```
 
-Given:
+No output if no dead code. `main()` and `init()` are excluded — entry points, not dead code.
 
-```go
-package main
+### JSON linter mode (`-j`)
 
-func main() {
-    helper1()
-    helper2()
+```json
+$ gfc -j ./pkg
+{
+  "calls": {
+    "main.go": {
+      "main": ["helper1", "helper2"],
+      "helper1": ["helper2"]
+    }
+  },
+  "dead": {
+    "main.go": ["orphanFunc"]
+  }
 }
-
-func helper1() { helper2() }
-func helper2() {}
-func unreachable() {} // ← filtered out
 ```
 
-**callgraph_calls.txt**:
-```
-main.go: main → main.go: helper1
-main.go: main → main.go: helper2
-main.go: helper1 → main.go: helper2
-```
+### Graph mode (`-g`)
 
-**callgraph_refs.txt**:
 ```
-main.go: helper2 — 2
-main.go: helper1 — 1
-main.go: main — 0
+$ gfc -g ./pkg
+callgraph.html — MermaidJS diagram
+unused.html — dead functions diagram
 ```
 
 ## License

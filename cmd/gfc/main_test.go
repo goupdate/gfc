@@ -103,12 +103,11 @@ func TestSelfGraph(t *testing.T) {
 	}
 
 	pkg := "main"
-	checks := []struct{ caller, callee string }{
+checks := []struct{ caller, callee string }{
 		{pkg + ".main", pkg + ".*CallGraph.parseDir"},
 		{pkg + ".main", pkg + ".*CallGraph.resolveEdges"},
 		{pkg + ".main", pkg + ".*CallGraph.generateMermaid"},
 		{pkg + ".main", pkg + ".*CallGraph.generateReportCalls"},
-		{pkg + ".main", pkg + ".*CallGraph.generateReportRefs"},
 		{pkg + ".main", pkg + ".*CallGraph.reachableFromRoots"},
 		{pkg + ".main", pkg + ".*CallGraph.filterReachable"},
 	}
@@ -134,17 +133,12 @@ func TestGeneratedOutput(t *testing.T) {
 		t.Error("mermaid should NOT contain unreachable")
 	}
 
-	calls := g.generateReportCalls()
+calls := g.generateReportCalls()
 	if len(calls) == 0 {
 		t.Error("empty calls report")
 	}
 	if !strings.Contains(calls, "helper1") {
 		t.Error("calls report should contain helper1")
-	}
-
-	refs := g.generateReportRefs()
-	if len(refs) == 0 {
-		t.Error("empty refs report")
 	}
 }
 
@@ -216,8 +210,9 @@ func TestLinterDeadOnSelf(t *testing.T) {
 	g := parseFixtureRaw(t, filepath.Join("..", "..", "cmd", "gfc"))
 	g.resolveEdges()
 	dead := g.linterDead()
-	if len(dead) != 0 {
-		t.Errorf("expected 0 dead funcs, got: %v", dead)
+	// generateReportRefs is dead — text output removed (no callgraph_refs.txt)
+	if len(dead) != 1 || !strings.Contains(dead[0], "generateReportRefs") {
+		t.Errorf("expected exactly 1 dead func (generateReportRefs), got: %v", dead)
 	}
 }
 

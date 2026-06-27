@@ -8,6 +8,7 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -17,6 +18,56 @@ import (
 	"sort"
 	"strings"
 )
+
+const helpText = `gfc — Go Function Caller
+Static call graph generator for Go projects. Produces MermaidJS diagrams
+and text reports from AST analysis — no runtime instrumentation needed.
+
+Usage:
+  gfc [flags] [directory]
+
+  If directory is omitted, the current directory (.) is used.
+
+Flags:
+  -h, --help      Show this help and exit
+  -g, --graphs    Generate callgraph.html + unused.html
+  -u, --unused    Print dead code list to stdout
+  -j, --json      Print JSON to stdout (for CI/linter integration)
+
+Modes:
+  (default)       Text report to stdout — calls grouped by file
+                  plus a dead code block at the end.
+  -u, --unused    Dead code list to stdout — functions with zero
+                  incoming calls. main() and init() are excluded
+                  (they are entry points).
+  -j, --json      JSON to stdout — structured for CI/linter
+                  integration. Output: {"calls": {...}, "dead": [...]}
+  -g, --graphs    Generate two HTML files with MermaidJS diagrams:
+                    callgraph.html — interactive call graph
+                    unused.html   — dead functions diagram
+                  MermaidJS is embedded, no CDN or network needed.
+
+Examples:
+  gfc ./pkg               Text report for ./pkg
+  gfc -u ./pkg             List dead functions only
+  gfc -j ./pkg             JSON output for linting pipeline
+  gfc -g ./pkg             Generate HTML diagrams
+  gfc                      Analyse current directory
+
+Features:
+  • MermaidJS diagram — interactive HTML with file subgraphs
+    and function nodes
+  • Call graph report — grouped by file, intra-file calls
+    shown without prefix
+  • Dead code detection — finds functions with zero incoming calls
+  • Reachability filter — only shows functions reachable
+    from main() and init()
+  • Receiver method resolution — correctly links g.method()
+    to *CallGraph.method
+  • Zero external dependencies — uses only Go standard library
+
+License: MIT
+`
 
 //go:embed mermaid.min.js
 var mermaidJS []byte
@@ -47,20 +98,27 @@ type CallGraph struct {
 }
 
 func main() {
-	// --unused mode: find dead functions (zero incoming calls)
-	// --stdout mode: output callgraph_calls.txt to stdout, skip all file writes
-	unusedMode := false
-	stdoutMode := false
+	var graphsMode, unusedMode, jsonMode, helpMode bool
 	root := "."
 	for i := 1; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--unused":
+		a := os.Args[i]
+		switch a {
+		case "-g", "--graphs":
+			graphsMode = true
+		case "-u", "--unused":
 			unusedMode = true
-		case "--stdout":
-			stdoutMode = true
+		case "-j", "--json":
+			jsonMode = true
+		case "-h", "--help":
+			helpMode = true
 		default:
-			root = os.Args[i]
+			root = a
 		}
+	}
+
+	if helpMode {
+		fmt.Print(helpText)
+		return
 	}
 
 	g := &CallGraph{
@@ -77,24 +135,42 @@ func main() {
 
 	g.resolveEdges()
 
-	if unusedMode {
-		dead := g.linterDead()
-		if len(dead) > 0 {
-			fmt.Println("dead code:")
-			for _, d := range dead {
-				fmt.Println(d)
-			}
-		}
+	// JSON-режим — на всём графе, без фильтрации достижимости
+	if jsonMode {
+		fmt.Print(g.generateJSON())
 		return
 	}
 
 	// Запоминаем dead-функции ДО фильтрации достижимости
 	deadFuncs := g.linterDead()
 
-	// Оставляем только функции, достижимые из main() и init()
+	// --unused: только потеряшки
+	if unusedMode {
+		if len(deadFuncs) > 0 {
+			fmt.Println("dead code:")
+			for _, d := range deadFuncs {
+				fmt.Println(d)
+			}
+		}
+		return
+	}
+
+	// Фильтруем достижимые из main/init
 	reachable := g.reachableFromRoots([]string{"main", "init"})
 	g.filterReachable(reachable)
 
+	// --graphs: только HTML-файлы
+	if graphsMode {
+		mermaidHTML := g.generateMermaid(root)
+		os.WriteFile("callgraph.html", []byte(mermaidHTML), 0644)
+		fmt.Println("callgraph.html — MermaidJS диаграмма")
+		unusedHTML := g.generateUnusedHTML(deadFuncs)
+		os.WriteFile("unused.html", []byte(unusedHTML), 0644)
+		fmt.Println("unused.html — граф потеряшек")
+		return
+	}
+
+	// default: текстовый отчёт в stdout
 	reportCalls := g.generateReportCalls()
 	if len(deadFuncs) > 0 {
 		reportCalls += "\n=== dead code ===\n"
@@ -102,33 +178,7 @@ func main() {
 			reportCalls += d + "\n"
 		}
 	}
-
-	if stdoutMode {
-		fmt.Print(reportCalls)
-		return
-	}
-
-	os.WriteFile("callgraph_calls.txt", []byte(reportCalls), 0644)
-	fmt.Println("callgraph_calls.txt — отчёт caller → callee")
-
-	reportRefs := g.generateReportRefs()
-	if len(deadFuncs) > 0 {
-		reportRefs += "\n=== dead code ===\n"
-		for _, d := range deadFuncs {
-			reportRefs += d + "\n"
-		}
-	}
-	os.WriteFile("callgraph_refs.txt", []byte(reportRefs), 0644)
-	fmt.Println("callgraph_refs.txt — отчёт по количеству ссылок")
-
-	// Генерируем callgraph.html и unused.html
-	mermaidHTML := g.generateMermaid(root)
-	os.WriteFile("callgraph.html", []byte(mermaidHTML), 0644)
-	fmt.Println("callgraph.html — MermaidJS диаграмма")
-
-	unusedHTML := g.generateUnusedHTML(deadFuncs)
-	os.WriteFile("unused.html", []byte(unusedHTML), 0644)
-	fmt.Println("unused.html — граф потеряшек")
+	fmt.Print(reportCalls)
 }
 
 // parseDir рекурсивно парсит .go-файлы (кроме _test.go).
@@ -515,27 +565,19 @@ graph TD
 }
 
 // generateReportCalls — отчёт caller → callee.
-func (g *CallGraph) generateReportCalls() string {
-	var sb strings.Builder
-	sb.WriteString("=== Call Graph: Caller → Callee ===\n\n")
+// generateJSON возвращает JSON-представление графа.
+// Формат: {"calls": {"file.go": {"func": ["callee1", ...]}}, "dead": {"file.go": ["func", ...]}}
+func (g *CallGraph) generateJSON() string {
+	type fileCalls = map[string]map[string][]string // file → func → callees
+	type fileDead = map[string][]string              // file → dead funcs
 
-	seen := make(map[string]bool)
+	calls := make(fileCalls)
 	for _, e := range g.Edges {
-		key := e.CallerFunc + "→" + e.Callee
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-
 		src, srcOK := g.Funcs[e.CallerFunc]
 		dst, dstOK := g.Funcs[e.Callee]
 		if !srcOK || !dstOK {
 			continue
 		}
-
-		srcShort := filepath.Base(src.File)
-		dstShort := filepath.Base(dst.File)
-
 		srcName := src.Name
 		if src.Recv != "" {
 			srcName = src.Recv + "." + src.Name
@@ -544,9 +586,87 @@ func (g *CallGraph) generateReportCalls() string {
 		if dst.Recv != "" {
 			dstName = dst.Recv + "." + dst.Name
 		}
+		srcFile := filepath.Base(src.File)
 
-		sb.WriteString(fmt.Sprintf("%s: %s → %s: %s\n",
-			srcShort, srcName, dstShort, dstName))
+		if calls[srcFile] == nil {
+			calls[srcFile] = make(map[string][]string)
+		}
+		calls[srcFile][srcName] = append(calls[srcFile][srcName], dstName)
+	}
+
+	dead := make(fileDead)
+	for _, d := range g.linterDead() {
+		// Формат: "file.go: pkg.func"
+		parts := strings.SplitN(d, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		file := strings.TrimSpace(parts[0])
+		funcName := strings.TrimSpace(parts[1])
+		// Убираем pkg.
+		if idx := strings.IndexByte(funcName, '.'); idx >= 0 {
+			funcName = funcName[idx+1:]
+		}
+		dead[file] = append(dead[file], funcName)
+	}
+
+	out := map[string]interface{}{"calls": calls, "dead": dead}
+	b, _ := json.MarshalIndent(out, "", "  ")
+	return string(b) + "\n"
+}
+
+func (g *CallGraph) generateReportCalls() string {
+	// Группируем рёбра по файлу caller-а
+	fileEdges := make(map[string][]CallEdge)
+	for _, e := range g.Edges {
+		src, srcOK := g.Funcs[e.CallerFunc]
+		_, dstOK := g.Funcs[e.Callee]
+		if !srcOK || !dstOK {
+			continue
+		}
+		fileEdges[src.File] = append(fileEdges[src.File], e)
+	}
+
+	// Сортируем файлы
+	var files []string
+	for f := range fileEdges {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	var sb strings.Builder
+	for _, file := range files {
+		short := filepath.Base(file)
+		sb.WriteString(fmt.Sprintf("=== %s ===\n", short))
+
+		seen := make(map[string]bool)
+		for _, e := range fileEdges[file] {
+			key := e.CallerFunc + "→" + e.Callee
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			src := g.Funcs[e.CallerFunc]
+			dst := g.Funcs[e.Callee]
+
+			srcName := src.Name
+			if src.Recv != "" {
+				srcName = src.Recv + "." + src.Name
+			}
+			dstName := dst.Name
+			if dst.Recv != "" {
+				dstName = dst.Recv + "." + dst.Name
+			}
+
+			// Callee из того же файла — без префикса; иначе file.go: func
+			if dst.File == file {
+				sb.WriteString(fmt.Sprintf("%s → %s\n", srcName, dstName))
+			} else {
+				dstShort := filepath.Base(dst.File)
+				sb.WriteString(fmt.Sprintf("%s → %s: %s\n", srcName, dstShort, dstName))
+			}
+		}
 	}
 	return sb.String()
 }
